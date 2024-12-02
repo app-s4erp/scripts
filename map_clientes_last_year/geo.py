@@ -2,6 +2,34 @@ import pandas as pd
 import plotly.express as px
 import json
 
+#################################
+# Query to generate clientes.csv
+#
+# SELECT 
+#     SUM(p."totalPedido") "tot_comprado",
+#     c.uf,
+#     c.cidade
+# FROM 
+#     pedidos p 
+# JOIN 
+#     contas c 
+# ON 
+#     (p."idContaCliente" = c.id) 
+# WHERE 
+#     p.deleted = 'N' 
+#     AND c."idEmpresa" = 1 
+#     AND p."tipoRegistro" = 'P' 
+#     AND p.status NOT IN ('Em aberto', 'Proposta', 'Cancelado') 
+#     AND p."dataAprovado" IS NOT NULL 
+#     AND p."dataFaturamento" IS NOT NULL 
+#     AND c.cidade IS NOT NULL
+#     AND c.uf IS NOT NULL
+#     AND p."totalPedido" > 0
+#     AND p."dataFaturamento" > CURRENT_DATE - INTERVAL '1 year'
+# GROUP BY 
+#     c.uf,
+#     c.cidade;
+
 def get_city_coordinates(uf: str, city_name: str) -> tuple:
     try:
         with open('estados.json', 'r', encoding='utf-8-sig') as estados_file:
