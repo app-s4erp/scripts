@@ -5,12 +5,15 @@ from google.oauth2.service_account import Credentials
 import os
 import pandas as pd
 import time
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 con = psycopg2.connect(
-    host="aws-0-sa-east-1.pooler.supabase.com",
-    database="postgres",
-    user="postgres.oukgagddzdptfopvzbli",
-    password="pRiZw5yp8spJP206"
+    host=os.getenv("DB_HOST"),
+    database=os.getenv("DB_NAME"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD")
 )
 
 pedidos = """
@@ -37,22 +40,20 @@ FROM
 LEFT JOIN LATERAL (
     SELECT 
         tr.id "idLigacao",
-        tr."dataLimite" "dataLigacao",
-        tr.descricao "descricaoLigacao",
-        tr."criadoPor" "idVendedorLigacao",
+        COALESCE(tr.call_at, tr.scheduled_at) "dataLigacao",
+        tr.description "descricaoLigacao",
+        tr.initiated_by_user_id "idVendedorLigacao",
         u.nome "nomeVendedorLigacao"
     FROM 
-        tarefas tr
+        crm.calls tr
     JOIN
-        usuarios u ON (tr."criadoPor" = u.id)
+        usuarios u ON (tr.initiated_by_user_id = u.id)
     WHERE 
-        tr."fkRelativo" = p."idContaCliente" AND
-        tr."dataLimite" <= p."dataAprovado" AND
-        tr."objetoRelativo" = 'contas' AND
-        tr.tipo = 'Ligação' AND
-        tr."statusLigacao" = 'Atendida'
+        tr.account_id = p."idContaCliente" AND
+        COALESCE(tr.call_at, tr.scheduled_at) <= p."dataAprovado" AND
+        tr.tenant_id = p."idEmpresa" AND tr.deleted_at IS NULL AND tr.answered IS TRUE
     ORDER BY 
-        tr."dataLimite" DESC
+        COALESCE(tr.call_at, tr.scheduled_at) DESC, tr.id DESC
     LIMIT 1
 ) t ON TRUE
 WHERE 
@@ -84,11 +85,11 @@ SELECT
     c."qntPedidosAprov",
     c."dataUltimoContatoBeforePedAprov",
    	u.nome "ultimoVendedorQueFezContato",
-   	t."dataLimite"::date "ultimoContato"
+    COALESCE(t.call_at, t.scheduled_at)::date "ultimoContato"
 FROM
     contas c
-    LEFT JOIN tarefas t ON (t.id = c."idTarefaUltLigacao")
-    LEFT JOIN usuarios u ON (t."criadoPor" = u.id)
+    LEFT JOIN LATERAL (SELECT cl.* FROM crm.calls cl WHERE cl.account_id = c.id AND cl.tenant_id = c."idEmpresa" AND cl.deleted_at IS NULL ORDER BY COALESCE(cl.call_at, cl.scheduled_at) DESC, cl.id DESC LIMIT 1) t ON TRUE
+    LEFT JOIN usuarios u ON (t.initiated_by_user_id = u.id)
 WHERE
     c."idEmpresa" = 1
     AND c.deleted = 'N'
@@ -98,31 +99,42 @@ WHERE
 ligacoes = """
 SELECT
     t.id,
-    t."dataLimite",
-    t."fkRelativo" "idConta",
-    t.titulo,
+    COALESCE(t.call_at, t.scheduled_at) "dataLimite",
+    t.account_id "idConta",
+    t.description titulo,
     c.uf,
-    t."tipoLigacao",
-    t."nextSteps",
-    t."statusLigacao",
-    t."criadoPor",
+    CASE t.call_type WHEN 0 THEN 'Prospecção' WHEN 1 THEN 'Reativação' WHEN 2 THEN 'Nutrição' WHEN 3 THEN 'Recebida' WHEN 4 THEN 'Negociação' WHEN 5 THEN 'Pós-venda' WHEN 6 THEN 'Outros' WHEN 7 THEN 'Pesquisa' WHEN 8 THEN 'Cobrança' END "tipoLigacao",
+    (
+        SELECT string_agg(
+            CASE step WHEN 0 THEN 'Enviar proposta' WHEN 1 THEN 'Enviar catálogo' WHEN 2 THEN 'Enviar WhatsApp' WHEN 3 THEN 'Aguardar retorno' WHEN 4 THEN 'Retornar ligação' WHEN 5 THEN 'Inativar cadastro' WHEN 6 THEN 'Aplicar pesquisa' WHEN 7 THEN 'Opt-out' WHEN 8 THEN 'E-mail marketing' WHEN 9 THEN 'Outros' END,
+            ', ' ORDER BY ord
+        )
+        FROM unnest(t.next_steps) WITH ORDINALITY AS steps(step, ord)
+    ) "nextSteps",
+    CASE WHEN t.scheduled_at IS NOT NULL AND t.answered IS NULL THEN 'Agendada' WHEN t.answered THEN 'Atendida' ELSE 'Não Atendida' END "statusLigacao",
+    t.initiated_by_user_id "criadoPor",
     u.nome,
-    t."criadoEm",
-    lc."classificacao"
+    t.created_at "criadoEm",
+    CASE
+        WHEN conta_vendedor."tipoConta" ILIKE '%representante%' THEN 'Representante'
+        WHEN c."tipoConta" ILIKE '%Cliente%' THEN 'Interno'
+        WHEN c."tipoConta" ILIKE '%Lead%' THEN 'Lead'
+        ELSE 'S/ Vendedor'
+    END "classificacao"
 FROM
-    tarefas t
+    crm.calls t
 JOIN
-	usuarios u ON (u.id = t."criadoPor")
+	usuarios u ON (u.id = t.initiated_by_user_id)
 JOIN
-	contas c ON (c.id = t."fkRelativo")
+    contas c ON (c.id = t.account_id)
 LEFT JOIN
-	ligacoesclassificacao lc ON (lc."idTarefa" = t.id)
+    usuarios vendedor ON (vendedor.id = c."idContaVendedor")
+LEFT JOIN
+    contas conta_vendedor ON (conta_vendedor.id = vendedor."idConta")
 WHERE
-    t.tipo = 'Ligação'
-    AND t."objetoRelativo" = 'contas'
-    AND t."idEmpresa" = 1
-    AND t."statusLigacao" <> 'Agendada'
-    AND t."dataLimite" >= '2024-06-01';
+    t.tenant_id = 1 AND t.deleted_at IS NULL
+    AND NOT (t.scheduled_at IS NOT NULL AND t.answered IS NULL)
+    AND COALESCE(t.call_at, t.scheduled_at) >= '2024-06-01';
 """
         
 queries_and_sheets = [
